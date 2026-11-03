@@ -1,0 +1,29 @@
+[package]
+name = "usbscan"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight multi-OS service that triggers a Sophos antivirus scan whenever USB storage is connected"
+repository = "https://github.com/loardracoon/sophos-auto-usbscan"
+license = "MIT"
+
+[dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics_Debug",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
