@@ -22,6 +22,7 @@ itself as a system service.
 - [Verifying it works](#verifying-it-works)
 - [Mass deployment](#mass-deployment)
 - [Troubleshooting](#troubleshooting)
+- [Validation status and known limitations](#validation-status-and-known-limitations)
 - [Releasing a version](#releasing-a-version)
 
 ---
@@ -78,7 +79,7 @@ A device that is not cached is scanned again on its next insertion.
 | macOS | Watches `/Volumes` (`kqueue`) and confirms with `diskutil` that the disk is on the USB bus. |
 | Windows | Native service; checks the drive letters every 2 s (negligible cost) and identifies the USB bus type. Also detects USB HDDs/SSDs that Windows reports as fixed disks, and removable media such as SD cards. |
 
-Measured footprint on Linux: ~500 KB binary, ~2 MB RAM and 0 % CPU while idle.
+Measured footprint on Linux: 0.4–0.6 MB binary, ~2 MB RAM and 0 % CPU while idle.
 
 ---
 
@@ -93,9 +94,15 @@ Linux (SPL) recommended for `cli` mode.
 curl -fsSL https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.sh | sudo sh
 ```
 
-The script detects the architecture, downloads the binary from the latest
-Release, verifies its SHA-256 checksum and runs `usbscan install`. To pin a
-version: `curl ... | sudo USBSCAN_VERSION=v0.1.0 sh`.
+Without `curl` (minimal Debian/Ubuntu images), use `wget`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.sh | sudo sh
+```
+
+The script checks for root and systemd, detects the architecture, downloads
+the binary from the latest Release, verifies its SHA-256 checksum and runs
+`usbscan install`. To pin a version: `curl ... | sudo USBSCAN_VERSION=v0.1.0 sh`.
 
 ### Option B — manual
 
@@ -121,6 +128,10 @@ sudo ./usbscan-linux-x86_64 install
 | Service | `/etc/systemd/system/usbscan.service` (enabled and started) |
 | Log | `/var/log/usbscan.log` |
 | Cache and status | `/var/lib/usbscan/` |
+
+> **RHEL, Rocky, Alma, CentOS, Fedora:** `sudo`'s `secure_path` does not
+> include `/usr/local/bin`, so `sudo usbscan` answers *command not found*. Use
+> the full path: `sudo /usr/local/bin/usbscan status`.
 
 ### Verify
 
@@ -158,8 +169,9 @@ Uninstalling keeps the configuration, cache and log. To remove everything:
 
 ## Installation on Windows
 
-**Requirements:** Windows 10/11 or Server 2016+ (x64), Administrator account.
-Sophos Intercept X / Endpoint recommended for `cli` mode.
+**Requirements:** Windows 10/11 or Server 2016+ (x64; Windows 11 on ARM runs
+the x64 binary through emulation), Administrator account, Windows PowerShell
+5.1 or PowerShell 7+. Sophos Intercept X / Endpoint recommended for `cli` mode.
 
 ### Option A — one-line installer
 
@@ -169,8 +181,20 @@ Open **PowerShell as Administrator**:
 irm https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.ps1 | iex
 ```
 
-The script downloads `usbscan-windows-x86_64.exe` from the latest Release,
-verifies its SHA-256 checksum and runs `usbscan install`.
+The script checks for Administrator rights, downloads
+`usbscan-windows-x86_64.exe` from the latest Release, verifies its SHA-256
+checksum and runs `usbscan install`. To pin a version, run
+`$env:USBSCAN_VERSION = 'v0.1.0'` first.
+
+If your policy forbids `iex`, download the script and run it explicitly
+(the execution policy applies only to this invocation):
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.ps1 -OutFile install.ps1
+```
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
 
 ### Option B — manual
 
@@ -193,6 +217,9 @@ usbscan-windows-x86_64.exe install
 | Service | `usbscan` — "USB Antivirus Scan Trigger", automatic start, LocalSystem account, automatic restart on failure |
 | Log | `C:\ProgramData\usbscan\usbscan.log` |
 | Cache and status | `C:\ProgramData\usbscan\` |
+
+The install folder is not added to `PATH`: call the binary by its full path,
+`& "C:\Program Files\usbscan\usbscan.exe" <command>`, from an elevated prompt.
 
 ### Verify
 
@@ -257,6 +284,11 @@ sudo launchctl kickstart -k system/com.usbscan.daemon
 
 For managed fleets, grant this permission via MDM (PPPC profile, see
 [Mass deployment](#mass-deployment)).
+
+To confirm the daemon has the permission, connect a USB drive and check that
+`touch_end` reports `files=` greater than 0 and `read_errors=0`. (The
+`full disk access` line of `usbscan doctor` checks the terminal that runs it,
+not the daemon.)
 
 ### What `install` does
 
@@ -466,7 +498,7 @@ the service rewrites on every event:
 |---------|-----|
 | `usbscan logs --scan 7` | every line of scan 7 only |
 | `usbscan logs -f` | follow the log (handles rotation) |
-| `usbscan doctor` | checks privileges, config errors, scanner path, log/data directory permissions, service state, systemd/mountinfo/uevent (Linux), diskutil and Full Disk Access (macOS) |
+| `usbscan doctor` | checks privileges, config errors, scanner path, log/data directory permissions, service state, systemd/mountinfo/uevent (Linux), diskutil and Full Disk Access of the calling terminal (macOS) |
 | `usbscan devices --all` | every mounted volume and the reason it is or is not treated as USB |
 | `usbscan cache list` / `clear` | inspect or reset the cache (takes effect on the running service immediately) |
 | `usbscan run --trace` | stop the service and run in the foreground with full output on the console |
@@ -513,6 +545,28 @@ your SIEM agent, alerting on `event=scan_alert` and `event=scan_failed`.
 | Drive is not rescanned | It is cached (`scan_bypass`); use `usbscan cache clear` or `cache_ttl = 0` |
 | `status` shows stale data | The service is not running: check `usbscan doctor` and the service manager |
 | Need full detail | `usbscan debug trace`, reproduce, `usbscan debug off` |
+
+## Validation status and known limitations
+
+| Area | Status |
+|------|--------|
+| Linux x86_64 binary | Run and tested: scan strategies, threat vs. error results, cache, log levels, runtime `debug on/off`, `status`, `doctor`, JSON logs, mount event detection |
+| `install.sh` | Tested: root/systemd checks, `curl` and `wget` download, pinned version, wrong repository, checksum mismatch |
+| Windows, macOS, Linux ARM64 binaries | Built by CI on native runners; **not yet run on real machines** |
+| `install.ps1` | Reviewed; **not yet executed on Windows** |
+| Service install (`systemd`, `launchd`, Windows SCM) | **Not yet tested on real machines** |
+| Real USB drive + real Sophos | **Not yet tested**; verify scanner arguments and `threat_exit_codes` for your Sophos version |
+
+Known limitations:
+
+- The Windows binary is not code-signed; SmartScreen or application-control
+  policies may require an allow rule.
+- On Linux, `install` requires systemd; on other init systems run
+  `usbscan run` under your own supervisor.
+- `debug on|trace|off` lasts until the service restarts.
+- The cache identifies devices by hardware serial and volume id: a drive
+  modified elsewhere and reconnected within `cache_ttl` is not rescanned
+  (use `cache_ttl = 0` where that matters).
 
 ## Releasing a version
 
