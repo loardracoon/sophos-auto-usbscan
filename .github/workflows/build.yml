@@ -16,49 +16,73 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-musl,  asset: usbscan-linux-x86_64 }
-          - { os: ubuntu-latest,  target: aarch64-unknown-linux-musl, asset: usbscan-linux-aarch64, cross: true }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,     asset: usbscan-windows-x86_64.exe }
-          - { os: macos-latest,   target: aarch64-apple-darwin,       asset: usbscan-macos-aarch64 }
-          - { os: macos-latest,   target: x86_64-apple-darwin,        asset: usbscan-macos-x86_64 }
+          - name: linux-x86_64
+            os: ubuntu-latest
+            builds: x86_64-unknown-linux-musl=usbscan-linux-x86_64
+          - name: linux-aarch64
+            os: ubuntu-latest
+            builds: aarch64-unknown-linux-musl=usbscan-linux-aarch64
+            cross: true
+          - name: windows-x86_64
+            os: windows-latest
+            builds: x86_64-pc-windows-msvc=usbscan-windows-x86_64.exe
+          # Both macOS binaries are built on one runner (Apple Silicon can
+          # cross-compile to Intel), halving the wait for scarce macOS runners.
+          - name: macos
+            os: macos-latest
+            builds: aarch64-apple-darwin=usbscan-macos-aarch64 x86_64-apple-darwin=usbscan-macos-x86_64
+    name: build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - if: matrix.cross
-        run: cargo install cross --locked
-      - if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-      - if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
-      - name: Rename binary
+      - uses: actions/checkout@v7
+
+      - name: Install Rust targets
         shell: bash
         run: |
-          mkdir dist
-          src=target/${{ matrix.target }}/release/usbscan
-          [ -f "$src.exe" ] && src="$src.exe"
-          cp "$src" "dist/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+          rustup toolchain install stable --profile minimal
+          for b in ${{ matrix.builds }}; do rustup target add "${b%%=*}"; done
+
+      - if: matrix.name == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p dist
+          for b in ${{ matrix.builds }}; do
+            target="${b%%=*}"; asset="${b#*=}"
+            if [ "${{ matrix.cross }}" = "true" ]; then
+              cross build --release --target "$target"
+            else
+              cargo build --release --target "$target"
+            fi
+            src="target/$target/release/usbscan"
+            [ -f "$src.exe" ] && src="$src.exe"
+            cp "$src" "dist/$asset"
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
+          name: usbscan-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
       - name: Checksums
-        run: cd dist && sha256sum * > SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
