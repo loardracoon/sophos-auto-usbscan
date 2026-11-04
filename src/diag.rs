@@ -59,7 +59,18 @@ pub fn logs(cfg: &Config, n: usize, follow: bool, scan: Option<&str>) -> Result<
     let mut f = OpenOptions::new().read(true).open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut text = String::new();
     f.read_to_string(&mut text).map_err(|e| e.to_string())?;
-    let lines: Vec<&str> = text.lines().filter(|l| keep(l)).collect();
+    // Older lines live in the rotated files (.1 newest): read them, newest
+    // first, until enough matching lines are collected.
+    let mut lines: Vec<String> = text.lines().filter(|l| keep(l)).map(String::from).collect();
+    for k in 1..cfg.log_max_files.max(1) {
+        if lines.len() >= n {
+            break;
+        }
+        let Ok(old) = fs::read_to_string(crate::log::rotated_path(path, k)) else { break };
+        let mut older: Vec<String> = old.lines().filter(|l| keep(l)).map(String::from).collect();
+        older.append(&mut lines);
+        lines = older;
+    }
     for l in &lines[lines.len().saturating_sub(n)..] {
         println!("{l}");
     }
@@ -208,6 +219,29 @@ pub fn doctor(cfg: &Config) -> Result<(), String> {
         Check::Info,
         "log level",
         format!("{} ({})", cfg.log_level.as_str(), if cfg.log_json { "json" } else { "text" }),
+    );
+    let used: u64 = std::iter::once(cfg.log_file.clone())
+        .chain((1..cfg.log_max_files.max(1)).map(|k| crate::log::rotated_path(&cfg.log_file, k)))
+        .filter_map(|p| fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let hs = |b: u64| {
+        if b >= 1 << 20 { format!("{:.1} MB", b as f64 / 1_048_576.0) } else { format!("{:.0} KB", b as f64 / 1024.0) }
+    };
+    chk(
+        Check::Info,
+        "log rotation",
+        if cfg.log_max_bytes == 0 {
+            format!("disabled (log grows without limit), {} used", hs(used))
+        } else {
+            format!(
+                "{} x {} files (max ~{}), {} used",
+                hs(cfg.log_max_bytes),
+                cfg.log_max_files,
+                hs(cfg.log_max_bytes * cfg.log_max_files as u64),
+                hs(used)
+            )
+        },
     );
     if override_file().exists() {
         chk(Check::Info, "debug override", format!("active: {}", fs::read_to_string(override_file()).unwrap_or_default().trim()));

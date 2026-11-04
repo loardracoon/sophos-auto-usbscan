@@ -126,7 +126,7 @@ sudo ./usbscan-linux-x86_64 install
 | Binary | `/usr/local/bin/usbscan` |
 | Configuration | `/etc/usbscan.conf` (created only if missing) |
 | Service | `/etc/systemd/system/usbscan.service` (enabled and started) |
-| Log | `/var/log/usbscan.log` |
+| Log | `/var/log/usbscan.log` (+ rotated `.1` … `.6`, max ~70 MB) |
 | Cache and status | `/var/lib/usbscan/` |
 
 > **RHEL, Rocky, Alma, CentOS, Fedora:** `sudo`'s `secure_path` does not
@@ -215,7 +215,7 @@ usbscan-windows-x86_64.exe install
 | Binary | `C:\Program Files\usbscan\usbscan.exe` |
 | Configuration | `C:\ProgramData\usbscan\usbscan.conf` |
 | Service | `usbscan` — "USB Antivirus Scan Trigger", automatic start, LocalSystem account, automatic restart on failure |
-| Log | `C:\ProgramData\usbscan\usbscan.log` |
+| Log | `C:\ProgramData\usbscan\usbscan.log` (+ rotated `.1` … `.6`, max ~70 MB) |
 | Cache and status | `C:\ProgramData\usbscan\` |
 
 The install folder is not added to `PATH`: call the binary by its full path,
@@ -297,7 +297,7 @@ not the daemon.)
 | Binary | `/usr/local/bin/usbscan` |
 | Configuration | `/etc/usbscan.conf` |
 | Service | `/Library/LaunchDaemons/com.usbscan.daemon.plist` (loaded, starts at boot) |
-| Log | `/var/log/usbscan.log` |
+| Log | `/var/log/usbscan.log` (+ rotated `.1` … `.6`, max ~70 MB) |
 | Cache and status | `/Library/Application Support/usbscan/` |
 
 ### Verify
@@ -368,7 +368,8 @@ editing, restart the service (`systemctl restart usbscan`,
 | `log_level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 | `log_format` | `text` | `text` or `json` (one JSON object per line) |
 | `log_file` / `cache_file` | per OS | alternative paths |
-| `log_max_bytes` | `5242880` | size at which the log is rotated (`.log.1`) |
+| `log_max_bytes` | `10M` | rotate the log when it reaches this size; accepts `K`/`M`/`G`; `0` = never rotate (unbounded) |
+| `log_max_files` | `7` | log files kept, including the active one (`usbscan.log` + `.1` … `.6`) |
 
 The cache identifies a device by vendor:product:serial:partition (Linux),
 model:volume UUID (macOS) or vendor:product:serial:volume serial (Windows).
@@ -467,6 +468,29 @@ The override lasts until `debug off` or a service restart. On Linux/macOS it
 is delivered with `SIGUSR1`; on Windows with service control code `128`
 (`sc control usbscan 128` also works after writing the override file).
 
+### Log rotation and disk usage
+
+The log never grows without limit. When `usbscan.log` reaches `log_max_bytes`
+(default 10 MB) it is renamed to `usbscan.log.1`, the previous `.1` becomes
+`.2`, and so on; the oldest file beyond `log_max_files` (default 7) is deleted.
+Disk usage is therefore capped at about `log_max_bytes × log_max_files`
+(**~70 MB** by default):
+
+```text
+usbscan.log      active file
+usbscan.log.1    newest rotated file
+...
+usbscan.log.6    oldest, deleted at the next rotation
+```
+
+At `info` level each scan writes only a few lines, so 70 MB holds a long
+history; the cap mostly matters when `debug`/`trace` is left on. Each rotation
+writes a `log rotated` line at the top of the new file. If the file cannot be
+renamed (for example another program holds it locked on Windows), it is
+truncated instead so the cap is still honoured. `usbscan doctor` shows the
+configured limit and the space currently used. When forwarding logs to a SIEM,
+point the agent at `usbscan.log` with rotation handling enabled.
+
 ### Live status
 
 `usbscan status` shows the service manager state plus `status.json`, which
@@ -497,6 +521,7 @@ the service rewrites on every event:
 | Command | Use |
 |---------|-----|
 | `usbscan logs --scan 7` | every line of scan 7 only |
+| `usbscan logs -n 500` | last 500 lines, reading the rotated files too when needed |
 | `usbscan logs -f` | follow the log (handles rotation) |
 | `usbscan doctor` | checks privileges, config errors, scanner path, log/data directory permissions, service state, systemd/mountinfo/uevent (Linux), diskutil and Full Disk Access of the calling terminal (macOS) |
 | `usbscan devices --all` | every mounted volume and the reason it is or is not treated as USB |

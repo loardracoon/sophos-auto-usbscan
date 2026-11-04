@@ -63,8 +63,52 @@ static JSON: AtomicBool = AtomicBool::new(false);
 struct Sink {
     path: PathBuf,
     file: Option<File>,
-    max: u64,
+    /// Bytes in the active file (avoids a stat() per line).
+    size: u64,
+    max_bytes: u64,
+    max_files: usize,
     console: bool,
+}
+
+/// `usbscan.log` -> `usbscan.log.<n>`
+pub fn rotated_path(path: &std::path::Path, n: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{n}", path.display()))
+}
+
+impl Sink {
+    /// usbscan.log -> .1 -> .2 ... -> .(max_files-1); the oldest is deleted.
+    /// Disk usage stays below about max_bytes x max_files.
+    fn rotate(&mut self) {
+        self.file = None; // close before renaming (required on Windows)
+        let keep = self.max_files.saturating_sub(1); // rotated files kept
+        // Delete the oldest, plus leftovers from a previously larger setting.
+        for n in keep.max(1)..=100 {
+            let _ = fs::remove_file(rotated_path(&self.path, n));
+        }
+        for n in (1..keep).rev() {
+            let _ = fs::rename(rotated_path(&self.path, n), rotated_path(&self.path, n + 1));
+        }
+        let moved = keep > 0 && fs::rename(&self.path, rotated_path(&self.path, 1)).is_ok();
+        // If the active file could not be renamed (max_files = 1, or another
+        // program holds it open on Windows), truncate it to honour the cap.
+        let opened = if moved {
+            OpenOptions::new().create(true).append(true).open(&self.path)
+        } else {
+            OpenOptions::new().create(true).write(true).truncate(true).open(&self.path)
+        };
+        self.file = opened.or_else(|_| OpenOptions::new().create(true).append(true).open(&self.path)).ok();
+        self.size = self.file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        let note = if moved {
+            format!("{} INFO  [log] log rotated: previous file is {}\n", timestamp(), rotated_path(&self.path, 1).display())
+        } else {
+            format!("{} WARN  [log] log truncated: could not rotate (max_files={} or file locked)\n", timestamp(), self.max_files)
+        };
+        if let Some(f) = self.file.as_mut() {
+            if f.write_all(note.as_bytes()).is_ok() {
+                self.size += note.len() as u64;
+            }
+        }
+    }
 }
 
 static SINK: Mutex<Option<Sink>> = Mutex::new(None);
@@ -82,8 +126,20 @@ pub fn init(cfg: &Config, console: bool) {
     if file.is_none() {
         eprintln!("warning: cannot open log file {}", cfg.log_file.display());
     }
-    *SINK.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(Sink { path: cfg.log_file.clone(), file, max: cfg.log_max_bytes, console });
+    let size = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+    let mut sink = Sink {
+        path: cfg.log_file.clone(),
+        file,
+        size,
+        max_bytes: cfg.log_max_bytes,
+        max_files: cfg.log_max_files.max(1),
+        console,
+    };
+    // A file left over from a previous run may already be over the limit.
+    if sink.max_bytes > 0 && sink.size > sink.max_bytes {
+        sink.rotate();
+    }
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
 }
 
 pub fn level() -> Level {
@@ -168,10 +224,11 @@ fn emit(level: Level, event: Option<&str>, msg: &str, fields: &[(&str, &dyn Disp
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
     if let Some(f) = sink.file.as_mut() {
-        let _ = f.write_all(line.as_bytes());
-        if sink.max > 0 && f.metadata().map(|m| m.len() > sink.max).unwrap_or(false) {
-            let _ = fs::rename(&sink.path, sink.path.with_extension("log.1"));
-            sink.file = OpenOptions::new().create(true).append(true).open(&sink.path).ok();
+        if f.write_all(line.as_bytes()).is_ok() {
+            sink.size += line.len() as u64;
+        }
+        if sink.max_bytes > 0 && sink.size >= sink.max_bytes {
+            sink.rotate();
         }
     }
 }

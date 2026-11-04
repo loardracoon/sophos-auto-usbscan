@@ -49,7 +49,10 @@ pub struct Config {
     pub log_level: Level,
     /// JSON lines instead of plain text (SIEM ingestion).
     pub log_json: bool,
+    /// Rotate the log when it exceeds this size (0 = never rotate).
     pub log_max_bytes: u64,
+    /// Total log files kept, including the active one (usbscan.log + .1 .. .N-1).
+    pub log_max_files: usize,
     pub touch_bytes: usize,
     pub touch_max_files: u64,
     pub touch_max_depth: usize,
@@ -102,7 +105,8 @@ impl Default for Config {
             log_file,
             log_level: Level::Info,
             log_json: false,
-            log_max_bytes: 5 * 1024 * 1024,
+            log_max_bytes: 10 * 1024 * 1024,
+            log_max_files: 7,
             touch_bytes: 4096,
             touch_max_files: 500_000,
             touch_max_depth: 64,
@@ -111,6 +115,19 @@ impl Default for Config {
             warnings: Vec::new(),
         }
     }
+}
+
+/// Accepts plain bytes or a K/M/G suffix: `10485760`, `10M`, `512K`, `1G`.
+fn parse_size(v: &str) -> Option<u64> {
+    let v = v.trim().to_ascii_uppercase();
+    let v = v.strip_suffix('B').unwrap_or(&v);
+    let (num, mul) = match v.chars().last()? {
+        'K' => (&v[..v.len() - 1], 1024),
+        'M' => (&v[..v.len() - 1], 1024 * 1024),
+        'G' => (&v[..v.len() - 1], 1024 * 1024 * 1024),
+        _ => (v, 1),
+    };
+    num.trim().parse::<u64>().ok()?.checked_mul(mul)
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -193,7 +210,8 @@ impl Config {
                         }
                     })
                     .is_some(),
-                "log_max_bytes" => v.parse().map(|x| c.log_max_bytes = x).is_ok(),
+                "log_max_bytes" => parse_size(v).map(|x| c.log_max_bytes = x).is_some(),
+                "log_max_files" => v.parse().map(|x: usize| c.log_max_files = x.clamp(1, 100)).is_ok(),
                 "touch_bytes" => v.parse().map(|x| c.touch_bytes = x).is_ok(),
                 "touch_max_files" => v.parse().map(|x| c.touch_max_files = x).is_ok(),
                 "touch_max_depth" => v.parse().map(|x| c.touch_max_depth = x).is_ok(),
@@ -227,6 +245,7 @@ impl Config {
         let _ = writeln!(s, "log_level = {}", self.log_level.as_str());
         let _ = writeln!(s, "log_format = {}", if self.log_json { "json" } else { "text" });
         let _ = writeln!(s, "log_max_bytes = {}", self.log_max_bytes);
+        let _ = writeln!(s, "log_max_files = {}", self.log_max_files);
         let _ = writeln!(s, "touch_bytes = {}", self.touch_bytes);
         let _ = writeln!(s, "touch_max_files = {}", self.touch_max_files);
         let _ = writeln!(s, "touch_max_depth = {}", self.touch_max_depth);
@@ -303,5 +322,23 @@ poll_ms = 2000
 log_level = info
 # log_format: text | json (one JSON object per line, for SIEM ingestion)
 log_format = text
-log_max_bytes = 5242880
+# Size-based rotation: when usbscan.log exceeds log_max_bytes it becomes
+# usbscan.log.1 (.1 newest ... .N-1 oldest) and the oldest file is deleted.
+# Disk usage is capped at about log_max_bytes x log_max_files (default 70 MB).
+# Sizes accept K/M/G suffixes. log_max_bytes = 0 disables rotation.
+log_max_bytes = 10M
+log_max_files = 7
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("10M"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_size("512k"), Some(512 * 1024));
+        assert_eq!(parse_size("1GB"), Some(1 << 30));
+        assert_eq!(parse_size("4096"), Some(4096));
+        assert_eq!(parse_size("abc"), None);
+    }
+}
