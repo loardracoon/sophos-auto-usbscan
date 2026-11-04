@@ -23,6 +23,22 @@ impl Cache {
         Cache { path, ttl, max, entries }
     }
 
+    pub fn entries(&self) -> &[(String, u64)] {
+        &self.entries
+    }
+
+    pub fn ttl(&self) -> u64 {
+        self.ttl
+    }
+
+    pub fn clear(&mut self) -> std::io::Result<()> {
+        self.entries.clear();
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     pub fn enabled(&self) -> bool {
         self.ttl > 0 && self.max > 0
     }

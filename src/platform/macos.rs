@@ -4,14 +4,15 @@
 //! backing disk is on the USB bus.
 
 use crate::config::Config;
-use crate::Device;
+use crate::diag::Check;
+use crate::{Device, Probe};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub use crate::unix::install_signal_handlers;
+pub use crate::unix::{is_admin, notify_reload, pid_alive};
 use crate::unix::{copy_self, require_root};
 
 const BIN: &str = "/usr/local/bin/usbscan";
@@ -21,8 +22,8 @@ const PLIST: &str = "/Library/LaunchDaemons/com.usbscan.daemon.plist";
 pub struct Watcher {
     kq: i32,
     _vol: i32,
-    /// (dev node, mount point) -> Some((id, desc)) if USB, None otherwise.
-    known: HashMap<(String, String), Option<(String, String)>>,
+    /// (dev node, mount point) -> classification (diskutil runs once per volume).
+    known: HashMap<(String, String), Probe>,
 }
 
 impl Watcher {
@@ -42,17 +43,13 @@ impl Watcher {
         }
     }
 
-    pub fn usb_mounts(&mut self) -> Vec<Device> {
+    pub fn probe(&mut self) -> Vec<Probe> {
         let mounts = list_mounts();
         self.known.retain(|k, _| mounts.contains(k));
-        let mut out = Vec::new();
-        for (from, on) in mounts {
-            let info = self.known.entry((from.clone(), on.clone())).or_insert_with(|| diskutil(&from)).clone();
-            if let Some((id, desc)) = info {
-                out.push(Device { mount: PathBuf::from(&on), id, desc: format!("{from} {desc}") });
-            }
-        }
-        out
+        mounts
+            .into_iter()
+            .map(|(from, on)| self.known.entry((from.clone(), on.clone())).or_insert_with(|| diskutil(&from, &on)).clone())
+            .collect()
     }
 
     pub fn wait(&mut self) {
@@ -89,25 +86,78 @@ fn list_mounts() -> Vec<(String, String)> {
     }
 }
 
-/// Returns (id, desc) when the disk is attached through USB.
-fn diskutil(dev: &str) -> Option<(String, String)> {
-    let out = Command::new("/usr/sbin/diskutil").args(["info", dev]).output().ok()?;
+/// Classifies a volume with `diskutil info` (Protocol: USB).
+fn diskutil(dev: &str, mount: &str) -> Probe {
+    let mut p = Probe {
+        mount: PathBuf::from(mount),
+        source: dev.to_string(),
+        usb: false,
+        id: String::new(),
+        desc: String::new(),
+        reason: String::new(),
+    };
+    let out = match Command::new("/usr/sbin/diskutil").args(["info", dev]).output() {
+        Ok(o) => o,
+        Err(e) => {
+            p.reason = format!("diskutil failed: {e}");
+            return p;
+        }
+    };
     let text = String::from_utf8_lossy(&out.stdout);
     let field = |k: &str| {
         text.lines()
-            .find_map(|l| l.trim().strip_prefix(k).map(|v| v.trim_start_matches(':').trim().to_string()))
+            .find_map(|l| l.trim().strip_prefix(k).and_then(|v| v.trim_start().strip_prefix(':')).map(|v| v.trim().to_string()))
             .unwrap_or_default()
     };
-    if field("Protocol") != "USB" {
-        return None;
+    let protocol = field("Protocol");
+    if protocol != "USB" {
+        p.reason = format!("diskutil Protocol: {}", if protocol.is_empty() { "<none>" } else { &protocol });
+        return p;
     }
     let media = field("Device / Media Name");
     let mut uuid = field("Volume UUID");
     if uuid.is_empty() {
         uuid = field("Disk / Partition UUID");
     }
-    let id = format!("{}:{}", media.replace(' ', "_"), if uuid.is_empty() { dev } else { &uuid });
-    Some((id, format!("{} {}", field("Type (Bundle)"), media)))
+    p.usb = true;
+    p.id = format!("{}:{}", media.replace(' ', "_"), if uuid.is_empty() { dev } else { &uuid });
+    p.desc = format!("{} {}", field("Type (Bundle)"), media).trim().to_string();
+    p.reason = "diskutil Protocol: USB".into();
+    p
+}
+
+pub fn service_state() -> String {
+    if !Path::new(PLIST).exists() {
+        return "not installed (no LaunchDaemon plist)".into();
+    }
+    match Command::new("launchctl").args(["print", &format!("system/{LABEL}")]).output() {
+        Ok(o) if o.status.success() => {
+            let t = String::from_utf8_lossy(&o.stdout);
+            let get = |k: &str| t.lines().find_map(|l| l.trim().strip_prefix(k)).unwrap_or("?").trim().to_string();
+            format!("{}, pid {}, last exit {}", get("state ="), get("pid ="), get("last exit code ="))
+        }
+        Ok(_) => "installed but not loaded".into(),
+        Err(e) => format!("unknown (launchctl: {e})"),
+    }
+}
+
+pub fn doctor(_cfg: &Config) -> Vec<(Check, String, String)> {
+    let mut v = Vec::new();
+    let du = Path::new("/usr/sbin/diskutil").exists();
+    v.push((if du { Check::Ok } else { Check::Fail }, "diskutil".into(), if du { "found" } else { "missing" }.into()));
+    // Reading the TCC database requires Full Disk Access: a cheap FDA probe
+    // for *this* process (the daemon needs its own grant for usbscan).
+    let fda = fs::File::open("/Library/Application Support/com.apple.TCC/TCC.db").is_ok();
+    v.push((
+        if fda { Check::Ok } else { Check::Warn },
+        "full disk access".into(),
+        if fda {
+            "granted to this process".into()
+        } else {
+            format!("not granted to this process; make sure {BIN} has Full Disk Access")
+        },
+    ));
+    v
 }
 
 pub fn release(_dev: &Device) {}

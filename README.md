@@ -3,94 +3,101 @@
 [![build](https://github.com/loardracoon/sophos-auto-usbscan/actions/workflows/build.yml/badge.svg)](https://github.com/loardracoon/sophos-auto-usbscan/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Varredura antivírus automática de pendrives e discos USB para Windows, Linux e macOS.**
-O programa se chama `usbscan`.
+**Automatic antivirus scanning of USB flash drives and disks on Windows, Linux and macOS.**
 
-Serviço leve e multiplataforma (Linux, Windows e macOS), escrito em Rust, que
-dispara uma varredura antivírus **sempre que um pendrive ou disco USB é
-conectado**. É um binário único, sem dependências (não precisa de PowerShell,
-udisks2, jq ou udev), que se instala sozinho como serviço do sistema.
+`usbscan` is a lightweight service written in Rust that triggers an antivirus
+scan **every time a USB storage device is connected**. It is a single binary
+with no dependencies (no PowerShell, udisks2, jq or udev required) that installs
+itself as a system service.
 
-- [Por que existe](#por-que-existe)
-- [Como funciona](#como-funciona)
-- [Instalação no Linux](#instalação-no-linux)
-- [Instalação no Windows](#instalação-no-windows)
-- [Instalação no macOS](#instalação-no-macos)
-- [Compilar a partir do código-fonte](#compilar-a-partir-do-código-fonte)
-- [Configuração](#configuração)
-- [Comandos](#comandos)
-- [Verificar se está funcionando](#verificar-se-está-funcionando)
-- [Implantação em massa](#implantação-em-massa)
-- [Solução de problemas](#solução-de-problemas)
-- [Publicar uma versão](#publicar-uma-versão)
+- [Why it exists](#why-it-exists)
+- [How it works](#how-it-works)
+- [Installation on Linux](#installation-on-linux)
+- [Installation on Windows](#installation-on-windows)
+- [Installation on macOS](#installation-on-macos)
+- [Building from source](#building-from-source)
+- [Configuration](#configuration)
+- [Commands](#commands)
+- [Observability and debugging](#observability-and-debugging)
+- [Verifying it works](#verifying-it-works)
+- [Mass deployment](#mass-deployment)
+- [Troubleshooting](#troubleshooting)
+- [Releasing a version](#releasing-a-version)
 
 ---
 
-## Por que existe
+## Why it exists
 
-A proteção em tempo real (on-access) do Sophos só inspeciona — e só alerta —
-quando um arquivo é **aberto ou lido**. Um pendrive conectado cujos arquivos
-ninguém abre nunca é verificado e nunca gera alerta no Sophos Central.
+Sophos real-time (on-access) protection only inspects — and only alerts on — a
+file when it is **opened or read**. A USB drive whose files nobody opens is
+never scanned and never raises an alert in Sophos Central.
 
-O usbscan resolve isso verificando ativamente cada volume USB assim que ele é
-montado.
+`usbscan` closes that gap by actively scanning every USB volume as soon as it is
+mounted.
 
-## Como funciona
+## How it works
 
-### Estratégias de varredura
+### Scan strategies
 
-| modo    | o que faz |
-|---------|-----------|
-| `auto`  | **padrão** — usa o scanner sob demanda se estiver instalado; senão, `touch` |
-| `cli`   | executa o scanner sob demanda do Sophos no ponto de montagem do pendrive |
-| `touch` | percorre o volume e abre/lê o início de cada arquivo, obrigando a proteção em tempo real a inspecionar cada um e a gerar o alerta |
-| `both`  | `cli` e, em seguida, `touch` |
+| Mode    | What it does |
+|---------|--------------|
+| `auto`  | **Default** — uses the on-demand scanner if installed, otherwise `touch` |
+| `cli`   | Runs the Sophos on-demand scanner against the USB mount point |
+| `touch` | Walks the volume and opens/reads the beginning of every file, forcing the real-time engine to inspect each one and raise the alert |
+| `both`  | `cli` followed by `touch` |
 
-Scanners detectados automaticamente (caminho e argumentos podem ser alterados
-na configuração):
+Scanners detected automatically (path and arguments can be overridden in the
+configuration):
 
-| Sistema | Binário | Argumentos |
-|---------|---------|------------|
+| OS | Binary | Arguments |
+|----|--------|-----------|
 | Linux | `/opt/sophos-spl/plugins/av/bin/avscanner` | `{path} --scan-archives` |
-| Linux (legado) | `/opt/sophos-av/bin/savscan` | `-archive {path}` |
+| Linux (legacy) | `/opt/sophos-av/bin/savscan` | `-archive {path}` |
 | Windows | `C:\Program Files\Sophos\Endpoint Defense\SophosInterceptXCLI.exe` | `scan --noui --expand_archives {path}` |
-| Windows (legado) | `C:\Program Files (x86)\Sophos\Sophos Anti-Virus\sav32cli.exe` | `-archive {path}` |
+| Windows (legacy) | `C:\Program Files (x86)\Sophos\Sophos Anti-Virus\sav32cli.exe` | `-archive {path}` |
 | macOS | `/usr/local/bin/sweep` | `-archive {path}` |
 
-**Resultado:** saída `0` do scanner = limpo, e o dispositivo entra no cache.
-Qualquer outro código (ameaça ou erro) é registrado como `ALERT/FAIL` e o
-dispositivo **não** entra no cache, sendo verificado de novo na próxima
-inserção. No modo `touch`, arquivos cuja leitura é bloqueada pelo antivírus
-(acesso negado / `ERROR_VIRUS_INFECTED`) são registrados como possível ameaça.
+> Verify the scanner arguments and exit codes against the Sophos version you
+> run; both are configurable (`scanner_args`, `threat_exit_codes`).
 
-### Detecção do USB
+### Results
 
-| Sistema | Mecanismo |
-|---------|-----------|
-| Linux | Acorda a cada montagem/desmontagem (`poll` em `/proc/self/mountinfo`) e identifica o USB pelo sysfs. A opção `auto_mount` monta somente-leitura as partições que ninguém montou (servidores sem interface gráfica) e desmonta após a varredura. |
-| macOS | Observa `/Volumes` (`kqueue`) e confirma com `diskutil` que o disco é USB. |
-| Windows | Serviço nativo; consulta as letras de unidade a cada 2 s (custo desprezível) e identifica o barramento USB. Detecta também HDs/SSDs USB que o Windows mostra como disco fixo. |
+| Outcome | Event | Cached? |
+|---------|-------|---------|
+| Scanner exit code `0` / every file read | `scan_clean` | yes |
+| Exit code listed in `threat_exit_codes` (default `3,24`) or a file blocked by the AV during `touch` (access denied / `ERROR_VIRUS_INFECTED`) | `scan_alert` | no |
+| Any other exit code, timeout, scanner missing | `scan_failed` | no |
 
-Consumo medido no Linux: binário de ~430 KB, ~2 MB de RAM e 0 % de CPU parado.
+A device that is not cached is scanned again on its next insertion.
+
+### USB detection
+
+| OS | Mechanism |
+|----|-----------|
+| Linux | Woken by every mount/unmount (`poll` on `/proc/self/mountinfo`); USB identified through sysfs. The `auto_mount` option mounts read-only any USB partition nobody mounted (headless servers) and unmounts it after the scan. |
+| macOS | Watches `/Volumes` (`kqueue`) and confirms with `diskutil` that the disk is on the USB bus. |
+| Windows | Native service; checks the drive letters every 2 s (negligible cost) and identifies the USB bus type. Also detects USB HDDs/SSDs that Windows reports as fixed disks, and removable media such as SD cards. |
+
+Measured footprint on Linux: ~500 KB binary, ~2 MB RAM and 0 % CPU while idle.
 
 ---
 
-## Instalação no Linux
+## Installation on Linux
 
-**Requisitos:** x86_64 ou ARM64, systemd, acesso root. Sophos Protection for
-Linux (SPL) recomendado para o modo `cli`.
+**Requirements:** x86_64 or ARM64, systemd, root access. Sophos Protection for
+Linux (SPL) recommended for `cli` mode.
 
-### Opção A — instalador automático
+### Option A — one-line installer
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.sh | sudo sh
 ```
 
-O script detecta a arquitetura, baixa o binário da última Release, confere o
-SHA-256 e executa `usbscan install`. Para fixar uma versão:
-`curl ... | sudo USBSCAN_VERSION=v0.1.0 sh`.
+The script detects the architecture, downloads the binary from the latest
+Release, verifies its SHA-256 checksum and runs `usbscan install`. To pin a
+version: `curl ... | sudo USBSCAN_VERSION=v0.1.0 sh`.
 
-### Opção B — manual
+### Option B — manual
 
 ```bash
 curl -fsSLO https://github.com/loardracoon/sophos-auto-usbscan/releases/latest/download/usbscan-linux-x86_64
@@ -102,32 +109,32 @@ chmod +x usbscan-linux-x86_64
 sudo ./usbscan-linux-x86_64 install
 ```
 
-(Em ARM64 use `usbscan-linux-aarch64`.) Os binários Linux são estáticos (musl)
-e funcionam em qualquer distribuição.
+(On ARM64 use `usbscan-linux-aarch64`.) The Linux binaries are statically linked
+(musl) and run on any distribution.
 
-### O que o `install` faz
+### What `install` does
 
-| Item | Local |
-|------|-------|
-| Binário | `/usr/local/bin/usbscan` |
-| Configuração | `/etc/usbscan.conf` (criada só se não existir) |
-| Serviço | `/etc/systemd/system/usbscan.service` (habilitado e iniciado) |
+| Item | Location |
+|------|----------|
+| Binary | `/usr/local/bin/usbscan` |
+| Configuration | `/etc/usbscan.conf` (created only if missing) |
+| Service | `/etc/systemd/system/usbscan.service` (enabled and started) |
 | Log | `/var/log/usbscan.log` |
-| Cache | `/var/lib/usbscan/cache.tsv` |
+| Cache and status | `/var/lib/usbscan/` |
 
-### Verificar
+### Verify
 
 ```bash
-systemctl status usbscan
+sudo usbscan status
 ```
 ```bash
-tail -f /var/log/usbscan.log
+sudo usbscan logs -f
 ```
 
-### Servidores sem interface gráfica
+### Headless servers
 
-Sem um automontador (GNOME/KDE/udisks), o pendrive não é montado e não há o
-que verificar. Ative em `/etc/usbscan.conf`:
+Without an automounter (GNOME/KDE/udisks) the USB drive is never mounted, so
+there is nothing to scan. Enable in `/etc/usbscan.conf`:
 
 ```ini
 auto_mount = true
@@ -136,91 +143,91 @@ auto_mount = true
 sudo systemctl restart usbscan
 ```
 
-### Atualizar / desinstalar
+### Update / uninstall
 
-Atualizar: rode o instalador de novo (ou `sudo ./usbscan-novo install`).
+Update: run the installer again (or `sudo ./usbscan-new install`).
 
 ```bash
 sudo usbscan uninstall
 ```
 
-A desinstalação mantém configuração, cache e log. Para apagar tudo:
+Uninstalling keeps the configuration, cache and log. To remove everything:
 `sudo rm -rf /etc/usbscan.conf /var/lib/usbscan /var/log/usbscan.log*`.
 
 ---
 
-## Instalação no Windows
+## Installation on Windows
 
-**Requisitos:** Windows 10/11 ou Server 2016+ (x64), conta de Administrador.
-Sophos Intercept X / Endpoint recomendado para o modo `cli`.
+**Requirements:** Windows 10/11 or Server 2016+ (x64), Administrator account.
+Sophos Intercept X / Endpoint recommended for `cli` mode.
 
-### Opção A — instalador automático
+### Option A — one-line installer
 
-Abra o **PowerShell como Administrador**:
+Open **PowerShell as Administrator**:
 
 ```powershell
 irm https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.ps1 | iex
 ```
 
-O script baixa `usbscan-windows-x86_64.exe` da última Release, confere o
-SHA-256 e executa `usbscan install`.
+The script downloads `usbscan-windows-x86_64.exe` from the latest Release,
+verifies its SHA-256 checksum and runs `usbscan install`.
 
-### Opção B — manual
+### Option B — manual
 
-1. Baixe `usbscan-windows-x86_64.exe` na página
-   [Releases](https://github.com/loardracoon/sophos-auto-usbscan/releases).
-2. Se baixou pelo navegador, clique com o botão direito → Propriedades →
-   marque **Desbloquear** (ou rode `Unblock-File .\usbscan-windows-x86_64.exe`).
-3. Em um prompt **como Administrador**:
+1. Download `usbscan-windows-x86_64.exe` from the
+   [Releases](https://github.com/loardracoon/sophos-auto-usbscan/releases) page.
+2. If downloaded with a browser, right-click → Properties → tick **Unblock**
+   (or run `Unblock-File .\usbscan-windows-x86_64.exe`).
+3. From an **elevated (Administrator)** prompt:
 
 ```bat
 usbscan-windows-x86_64.exe install
 ```
 
-### O que o `install` faz
+### What `install` does
 
-| Item | Local |
-|------|-------|
-| Binário | `C:\Program Files\usbscan\usbscan.exe` |
-| Configuração | `C:\ProgramData\usbscan\usbscan.conf` |
-| Serviço | `usbscan` — "USB Antivirus Scan Trigger", início automático, conta LocalSystem, reinício automático em falha |
+| Item | Location |
+|------|----------|
+| Binary | `C:\Program Files\usbscan\usbscan.exe` |
+| Configuration | `C:\ProgramData\usbscan\usbscan.conf` |
+| Service | `usbscan` — "USB Antivirus Scan Trigger", automatic start, LocalSystem account, automatic restart on failure |
 | Log | `C:\ProgramData\usbscan\usbscan.log` |
-| Cache | `C:\ProgramData\usbscan\cache.tsv` |
+| Cache and status | `C:\ProgramData\usbscan\` |
 
-### Verificar
+### Verify
 
 ```powershell
-Get-Service usbscan
+& "C:\Program Files\usbscan\usbscan.exe" status
 ```
 ```powershell
-Get-Content C:\ProgramData\usbscan\usbscan.log -Wait -Tail 20
+& "C:\Program Files\usbscan\usbscan.exe" logs -f
 ```
 
-### Atualizar / desinstalar
+### Update / uninstall
 
-Atualizar: rode o instalador de novo — o serviço é parado, o binário trocado e
-o serviço reiniciado.
+Update: run the installer again — the service is stopped, the binary replaced
+and the service restarted.
 
 ```bat
 "C:\Program Files\usbscan\usbscan.exe" uninstall
 ```
 
-Para apagar também configuração e log: `rmdir /s /q C:\ProgramData\usbscan`.
+To also delete configuration and logs: `rmdir /s /q C:\ProgramData\usbscan`.
 
 ---
 
-## Instalação no macOS
+## Installation on macOS
 
-**Requisitos:** macOS 11 ou superior (Intel ou Apple Silicon), conta de
-administrador.
+**Requirements:** macOS 11 or later (Intel or Apple Silicon), administrator
+account.
 
-### Opção A — instalador automático
+### Option A — one-line installer
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/loardracoon/sophos-auto-usbscan/main/scripts/install.sh | sudo sh
 ```
 
-### Opção B — manual
+### Option B — manual
 
 ```bash
 curl -fsSLO https://github.com/loardracoon/sophos-auto-usbscan/releases/latest/download/usbscan-macos-aarch64
@@ -235,44 +242,44 @@ xattr -d com.apple.quarantine usbscan-macos-aarch64 2>/dev/null; true
 sudo ./usbscan-macos-aarch64 install
 ```
 
-(Em Macs Intel use `usbscan-macos-x86_64`.)
+(On Intel Macs use `usbscan-macos-x86_64`.)
 
-### Passo obrigatório: Acesso Total ao Disco
+### Required step: Full Disk Access
 
-O macOS bloqueia a leitura de volumes removíveis por processos sem permissão.
-Abra **Ajustes do Sistema → Privacidade e Segurança → Acesso Total ao Disco**,
-clique em **+**, pressione `⌘⇧G`, digite `/usr/local/bin/usbscan` e ative.
-Depois reinicie o serviço:
+macOS blocks processes without permission from reading removable volumes.
+Open **System Settings → Privacy & Security → Full Disk Access**, click **+**,
+press `⌘⇧G`, type `/usr/local/bin/usbscan` and enable it. Then restart the
+service:
 
 ```bash
 sudo launchctl kickstart -k system/com.usbscan.daemon
 ```
 
-Em frota gerenciada, conceda essa permissão por MDM (perfil PPPC, veja
-[Implantação em massa](#implantação-em-massa)).
+For managed fleets, grant this permission via MDM (PPPC profile, see
+[Mass deployment](#mass-deployment)).
 
-### O que o `install` faz
+### What `install` does
 
-| Item | Local |
-|------|-------|
-| Binário | `/usr/local/bin/usbscan` |
-| Configuração | `/etc/usbscan.conf` |
-| Serviço | `/Library/LaunchDaemons/com.usbscan.daemon.plist` (carregado, início no boot) |
+| Item | Location |
+|------|----------|
+| Binary | `/usr/local/bin/usbscan` |
+| Configuration | `/etc/usbscan.conf` |
+| Service | `/Library/LaunchDaemons/com.usbscan.daemon.plist` (loaded, starts at boot) |
 | Log | `/var/log/usbscan.log` |
-| Cache | `/Library/Application Support/usbscan/cache.tsv` |
+| Cache and status | `/Library/Application Support/usbscan/` |
 
-### Verificar
+### Verify
 
 ```bash
-sudo launchctl print system/com.usbscan.daemon | head -20
+sudo usbscan status
 ```
 ```bash
-tail -f /var/log/usbscan.log
+sudo usbscan logs -f
 ```
 
-### Atualizar / desinstalar
+### Update / uninstall
 
-Atualizar: rode o instalador de novo.
+Update: run the installer again.
 
 ```bash
 sudo usbscan uninstall
@@ -280,9 +287,9 @@ sudo usbscan uninstall
 
 ---
 
-## Compilar a partir do código-fonte
+## Building from source
 
-Requer [Rust](https://rustup.rs) estável.
+Requires stable [Rust](https://rustup.rs).
 
 ```bash
 git clone https://github.com/loardracoon/sophos-auto-usbscan
@@ -291,11 +298,11 @@ git clone https://github.com/loardracoon/sophos-auto-usbscan
 cd sophos-auto-usbscan && cargo build --release
 ```
 
-O binário fica em `target/release/usbscan` (`usbscan.exe` no Windows). Depois,
-`sudo target/release/usbscan install` (ou `usbscan.exe install` como
-Administrador).
+The binary is written to `target/release/usbscan` (`usbscan.exe` on Windows).
+Then run `sudo target/release/usbscan install` (or `usbscan.exe install` as
+Administrator).
 
-Binário Linux estático (roda em qualquer distro):
+Static Linux binary (runs on any distribution):
 
 ```bash
 rustup target add x86_64-unknown-linux-musl && cargo build --release --target x86_64-unknown-linux-musl
@@ -303,95 +310,220 @@ rustup target add x86_64-unknown-linux-musl && cargo build --release --target x8
 
 ---
 
-## Configuração
+## Configuration
 
-O arquivo é criado comentado pelo `install` e nunca é sobrescrito. Depois de
-alterar, reinicie o serviço (`systemctl restart usbscan`,
-`Restart-Service usbscan` ou `launchctl kickstart -k system/com.usbscan.daemon`).
+`install` creates a commented configuration file and never overwrites it. After
+editing, restart the service (`systemctl restart usbscan`,
+`Restart-Service usbscan` or `launchctl kickstart -k system/com.usbscan.daemon`).
+`usbscan config` prints the effective values and any invalid line.
 
-| Chave | Padrão | Descrição |
-|-------|--------|-----------|
-| `mode` | `auto` | `auto`, `cli`, `touch` ou `both` |
-| `scanner` | *(auto)* | caminho do scanner sob demanda |
-| `scanner_args` | *(auto)* | argumentos; `{path}` vira o ponto de montagem |
-| `scan_timeout` | `3600` | segundos até abortar o scanner |
-| `settle` | `3` | segundos de espera após a montagem antes de verificar |
-| `scan_on_start` | `true` | verificar pendrives já conectados quando o serviço inicia |
-| `cache_ttl` | `86400` | não verificar de novo um dispositivo limpo dentro deste prazo (segundos); `0` = sempre verificar |
-| `cache_max` | `10` | quantidade de dispositivos guardados no cache |
-| `touch_bytes` | `4096` | bytes lidos de cada arquivo no modo `touch` |
-| `touch_max_files` | `500000` | limite de arquivos por volume no modo `touch` |
-| `touch_max_depth` | `64` | profundidade máxima de pastas no modo `touch` |
-| `auto_mount` | `false` | *Linux* — montar somente-leitura partições USB não montadas |
-| `poll_ms` | `2000` | *Windows* — intervalo de verificação das unidades |
-| `log_file` / `cache_file` | por SO | caminhos alternativos |
-| `log_max_bytes` | `5242880` | tamanho para rotacionar o log (`.log.1`) |
-| `debug` | `false` | log detalhado |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `mode` | `auto` | `auto`, `cli`, `touch` or `both` |
+| `scanner` | *(auto)* | path of the on-demand scanner |
+| `scanner_args` | *(auto)* | arguments; `{path}` is replaced by the mount point |
+| `threat_exit_codes` | `3,24` | scanner exit codes reported as a threat (`scan_alert`); other non-zero codes are `scan_failed` |
+| `scan_timeout` | `3600` | seconds before the scanner is aborted |
+| `settle` | `3` | seconds to wait after mounting before scanning |
+| `scan_on_start` | `true` | scan USB drives already connected when the service starts |
+| `cache_ttl` | `86400` | do not rescan a device found clean within this many seconds; `0` = always scan |
+| `cache_max` | `10` | number of devices kept in the cache |
+| `touch_bytes` | `4096` | bytes read from each file in `touch` mode |
+| `touch_max_files` | `500000` | file limit per volume in `touch` mode |
+| `touch_max_depth` | `64` | maximum directory depth in `touch` mode |
+| `auto_mount` | `false` | *Linux* — mount unmounted USB partitions read-only |
+| `poll_ms` | `2000` | *Windows* — drive polling interval |
+| `log_level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
+| `log_format` | `text` | `text` or `json` (one JSON object per line) |
+| `log_file` / `cache_file` | per OS | alternative paths |
+| `log_max_bytes` | `5242880` | size at which the log is rotated (`.log.1`) |
 
-O cache identifica o dispositivo por fabricante:produto:serial:partição
-(Linux), modelo:UUID do volume (macOS) ou fabricante:produto:serial:serial do
-volume (Windows). Em ambiente de alto risco use `cache_ttl = 0`: um pendrive
-limpo pode ser alterado em outra máquina e reconectado dentro do prazo do cache.
+The cache identifies a device by vendor:product:serial:partition (Linux),
+model:volume UUID (macOS) or vendor:product:serial:volume serial (Windows).
+In high-risk environments use `cache_ttl = 0`: a clean drive can be modified on
+another machine and reconnected within the cache window.
 
-## Comandos
+## Commands
 
 ```text
-usbscan install   [--config ARQ]            instala e inicia o serviço
-usbscan uninstall                           para e remove o serviço
-usbscan run       [--debug] [--no-cache]    executa em primeiro plano (diagnóstico)
-usbscan scan CAMINHO [--debug]              verifica um caminho agora
-usbscan devices                             lista volumes USB montados e o ID do cache
-usbscan config                              mostra a configuração efetiva
+SERVICE
+  usbscan install   [--config FILE]   install binary + config and start the service
+  usbscan uninstall                   stop and remove the service
+
+RUN / SCAN
+  usbscan run  [--debug|--trace] [--json] [--no-cache] [--config FILE]
+                                      run the monitor in the foreground (logs to console)
+  usbscan scan PATH [--debug|--trace] scan a path now with the configured strategy
+
+OBSERVABILITY / TROUBLESHOOTING
+  usbscan status [--json]             service state, counters, active scans, recent events
+  usbscan logs [-n N] [-f] [--scan ID]
+                                      show the log (last N lines, follow, one scan only)
+  usbscan debug on|trace|off          change the running service's log level, no restart
+  usbscan doctor                      check installation, permissions and scanner
+  usbscan devices [--all]             USB volumes detected (--all: every volume + reason)
+  usbscan cache [list|clear]          show or clear the scanned-device cache
+  usbscan config                      print the effective configuration
+  usbscan version
 ```
 
-## Verificar se está funcionando
+On Windows, call the installed binary as
+`"C:\Program Files\usbscan\usbscan.exe" <command>` from an elevated prompt; on
+Linux/macOS use `sudo usbscan <command>`.
 
-1. Conecte um pendrive e acompanhe o log. Deve aparecer:
-   `USB volume detected` → `scan start` → `CLEAN` (ou `ALERT/FAIL`).
-2. Teste de detecção: grave o
-   [arquivo de teste EICAR](https://www.eicar.org/download-anti-malware-testfile/)
-   no pendrive **com a proteção em tempo real desativada** (ou em outra máquina),
-   reconecte e confirme o alerta no log e no Sophos Central.
-3. `usbscan devices` mostra se o volume está sendo reconhecido como USB.
+## Observability and debugging
 
-## Implantação em massa
+### Log format and traceability
 
-O instalador é silencioso e idempotente; basta distribuir o binário e executar
-`install` com privilégio administrativo.
+Every line has a millisecond UTC timestamp, a level and the thread that wrote
+it. Each scan runs in a worker named `scan-<id>`, so **every line of one scan —
+including the scanner's own output — carries the same correlation id**:
 
-- **Windows (GPO / Intune / SCCM):** script de inicialização ou Win32 app com
-  `usbscan-windows-x86_64.exe install`; desinstalação:
-  `"C:\Program Files\usbscan\usbscan.exe" uninstall`. Uma configuração padrão
-  pode ser copiada para `C:\ProgramData\usbscan\usbscan.conf` antes do install.
-- **Linux (Ansible / Salt / shell):** copie o binário e rode
-  `usbscan install`; distribua `/etc/usbscan.conf` pelo gerenciador.
-- **macOS (Jamf / Intune / Kandji):** pacote ou script com
-  `usbscan-macos-<arch> install`, mais um perfil **PPPC** concedendo
-  `SystemPolicyAllFiles` (Acesso Total ao Disco) ao caminho
-  `/usr/local/bin/usbscan`.
+```text
+2026-11-04T21:40:27.088Z INFO  [main]   event=device_detected mount=/media/u/STICK device=0781:5581:4C53...:p1 desc="/dev/sdb1 vfat SanDisk Ultra"
+2026-11-04T21:40:30.091Z INFO  [scan-7] event=scan_start scan=7 mount=/media/u/STICK device=0781:5581:4C53...:p1
+2026-11-04T21:40:30.092Z INFO  [scan-7] event=cli_start scanner=/opt/sophos-spl/plugins/av/bin/avscanner args="/media/u/STICK --scan-archives"
+2026-11-04T21:40:31.345Z INFO  [scan-7] event=scanner_output stream=stdout line="..."
+2026-11-04T21:40:31.594Z INFO  [scan-7] event=cli_end exit_code=24 duration_ms=1502
+2026-11-04T21:40:31.594Z ERROR [scan-7] event=scan_alert scan=7 mount=/media/u/STICK device=... duration_ms=1503 result="scanner exit code 24"
+```
 
-## Solução de problemas
+Important lines are structured `event=<name> key=value` records. Events:
 
-| Sintoma | Causa provável / solução |
-|---------|--------------------------|
-| Nada no log ao conectar (Linux) | O pendrive não foi montado: ative `auto_mount = true` |
-| `mode=cli but no scanner binary found` | Sophos sem scanner sob demanda nesse caminho: ajuste `scanner =` ou use `mode = touch` |
-| `scanner exit code N` | Ameaça encontrada ou erro do scanner; a saída do scanner fica no próprio log |
-| macOS: `touched 0 files` / erros de leitura | Falta Acesso Total ao Disco para `/usr/local/bin/usbscan` |
-| Windows: `Access is denied` no install | Prompt não está como Administrador |
-| Pendrive não é verificado de novo | Está no cache (`BYPASS` no log); use `cache_ttl = 0` ou `usbscan run --no-cache` |
-| Diagnóstico detalhado | pare o serviço e rode `usbscan run --debug` |
+| Event | Level | Meaning |
+|-------|-------|---------|
+| `service_start` / `service_stop` | info | service lifecycle, with version, pid, config, mode and scanner |
+| `device_present` | info | USB volume already mounted at service start |
+| `device_detected` / `device_removed` | info | USB volume mounted / unmounted |
+| `scan_bypass` | info | skipped: device scanned clean within `cache_ttl` |
+| `scan_start` | info | scan begins (`scan` = correlation id) |
+| `cli_start` / `cli_end` | info | scanner command line, exit code and duration |
+| `scanner_output` | info | each line printed by the scanner (stdout/stderr) |
+| `touch_start` / `touch_end` | info | file walk with counters (files, dirs, bytes, errors, blocked) |
+| `av_blocked` | warn | the AV blocked access to a file during `touch` |
+| `scan_clean` | info | no threat found |
+| `scan_alert` | error | threat found |
+| `scan_failed` | warn | scan could not complete |
+| `scan_skipped` | warn | volume disappeared before the scan |
+| `log_level_changed` | error* | runtime level changed with `usbscan debug` (*always logged) |
 
-## Publicar uma versão
+With `log_format = json` (or `usbscan run --json`) each line is a JSON object
+(`ts`, `level`, `thread`, `pid`, `event`, `msg` and the event fields), ready
+for Splunk, Elastic, Sentinel or any SIEM.
 
-O workflow `.github/workflows/build.yml` compila os 5 binários a cada push.
-Ao criar uma tag `v*`, ele também publica a Release com os binários e o
-`SHA256SUMS` usados pelos instaladores:
+### Log levels
+
+| Level | Adds |
+|-------|------|
+| `info` | the events above (default) |
+| `debug` | strategy selection, cache hit/miss decisions, settle wait, scanner pid, `touch` progress every 1000 files, read errors, effective configuration at start |
+| `trace` | every volume evaluated and why it was ignored, every file touched (very verbose) |
+
+### Changing the level without restarting
+
+```bash
+sudo usbscan debug on       # debug
+```
+```bash
+sudo usbscan debug trace    # trace
+```
+```bash
+sudo usbscan debug off      # back to log_level from the config file
+```
+
+The override lasts until `debug off` or a service restart. On Linux/macOS it
+is delivered with `SIGUSR1`; on Windows with service control code `128`
+(`sc control usbscan 128` also works after writing the override file).
+
+### Live status
+
+`usbscan status` shows the service manager state plus `status.json`, which
+the service rewrites on every event:
+
+```json
+{
+  "version": "0.1.0",
+  "pid": 671,
+  "started": "2026-11-04T21:40:35Z",
+  "uptime_secs": 3600,
+  "mode": "auto",
+  "scanner": "/opt/sophos-spl/plugins/av/bin/avscanner",
+  "log_level": "info",
+  "counters": {"detected": 4, "removed": 3, "scans": 3, "clean": 2, "alerts": 1, "failed": 0, "bypassed": 1},
+  "last_alert": "2026-11-04T21:40:31.594Z scan-7 /media/u/STICK ...: threat: scanner exit code 24",
+  "active_scans": [],
+  "usb_volumes": [{"mount": "/media/u/STICK", "id": "...", "desc": "..."}],
+  "recent_events": ["..."]
+}
+```
+
+`usbscan status --json` prints a single JSON document for monitoring agents
+(Zabbix, Nagios, Prometheus textfile exporters, etc.).
+
+### Other tools
+
+| Command | Use |
+|---------|-----|
+| `usbscan logs --scan 7` | every line of scan 7 only |
+| `usbscan logs -f` | follow the log (handles rotation) |
+| `usbscan doctor` | checks privileges, config errors, scanner path, log/data directory permissions, service state, systemd/mountinfo/uevent (Linux), diskutil and Full Disk Access (macOS) |
+| `usbscan devices --all` | every mounted volume and the reason it is or is not treated as USB |
+| `usbscan cache list` / `clear` | inspect or reset the cache (takes effect on the running service immediately) |
+| `usbscan run --trace` | stop the service and run in the foreground with full output on the console |
+
+## Verifying it works
+
+1. Run `usbscan doctor`: there must be no `[FAIL]` lines.
+2. Run `usbscan logs -f`, connect a USB drive and look for
+   `device_detected` → `scan_start` → `scan_clean` (or `scan_alert`).
+3. Detection test: write the
+   [EICAR test file](https://www.eicar.org/download-anti-malware-testfile/) to
+   the drive **with real-time protection disabled** (or on another machine),
+   reconnect it and confirm the `scan_alert` event and the alert in Sophos
+   Central.
+4. `usbscan devices --all` shows whether the volume is recognised as USB and why.
+
+## Mass deployment
+
+The installer is silent and idempotent: distribute the binary and run
+`install` with administrative privileges.
+
+- **Windows (GPO / Intune / SCCM):** startup script or Win32 app running
+  `usbscan-windows-x86_64.exe install`; uninstall with
+  `"C:\Program Files\usbscan\usbscan.exe" uninstall`. A standard configuration
+  can be copied to `C:\ProgramData\usbscan\usbscan.conf` before `install`.
+- **Linux (Ansible / Salt / shell):** copy the binary and run `usbscan install`;
+  distribute `/etc/usbscan.conf` with your configuration manager.
+- **macOS (Jamf / Intune / Kandji):** package or script running
+  `usbscan-macos-<arch> install`, plus a **PPPC** profile granting
+  `SystemPolicyAllFiles` (Full Disk Access) to `/usr/local/bin/usbscan`.
+
+For central monitoring, set `log_format = json` and forward the log file with
+your SIEM agent, alerting on `event=scan_alert` and `event=scan_failed`.
+
+## Troubleshooting
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| Nothing logged when a drive is connected (Linux) | The drive was not mounted: set `auto_mount = true`. Confirm with `usbscan devices --all` |
+| `mode=cli but no scanner binary found` | No on-demand scanner at that path: set `scanner =` or use `mode = touch` |
+| `scan_failed ... scanner exit code N` | Scanner error, or a threat code missing from `threat_exit_codes`; check the `scanner_output` lines of that scan with `usbscan logs --scan ID` |
+| macOS: `touch_end files=0` / read errors | Full Disk Access missing for `/usr/local/bin/usbscan` |
+| Windows: `Access is denied` | The prompt is not elevated (Administrator) |
+| Drive is not rescanned | It is cached (`scan_bypass`); use `usbscan cache clear` or `cache_ttl = 0` |
+| `status` shows stale data | The service is not running: check `usbscan doctor` and the service manager |
+| Need full detail | `usbscan debug trace`, reproduce, `usbscan debug off` |
+
+## Releasing a version
+
+The `.github/workflows/build.yml` workflow builds the 5 binaries on every push.
+When a `v*` tag is pushed, it also publishes a Release with the binaries and
+the `SHA256SUMS` file used by the installers:
 
 ```bash
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-## Licença
+## License
 
-MIT — veja [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

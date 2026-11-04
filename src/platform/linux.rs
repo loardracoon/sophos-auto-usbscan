@@ -4,7 +4,8 @@
 //! udev/udisks/jq dependency.
 
 use crate::config::Config;
-use crate::Device;
+use crate::diag::Check;
+use crate::{Device, Probe};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -29,26 +30,39 @@ impl Watcher {
         Watcher { mountinfo, uevent, settle: cfg.settle }
     }
 
-    pub fn usb_mounts(&mut self) -> Vec<Device> {
+    /// Evaluates every block-device mount and classifies it as USB or not.
+    pub fn probe(&mut self) -> Vec<Probe> {
         let mut text = String::new();
         let _ = self.mountinfo.seek(SeekFrom::Start(0));
         let _ = self.mountinfo.read_to_string(&mut text);
-        let mut out: Vec<Device> = Vec::new();
+        let mut out: Vec<Probe> = Vec::new();
         for line in text.lines() {
             let Some(m) = parse_mountinfo(line) else { continue };
-            if !m.source.starts_with("/dev/") || out.iter().any(|d| d.mount == m.mount) {
+            if !m.source.starts_with("/dev/") || out.iter().any(|d| d.mount.as_os_str() == m.mount.as_str()) {
                 continue;
             }
-            let Ok(sys) = fs::canonicalize(format!("/sys/dev/block/{}", m.majmin)) else { continue };
-            if !sys.to_string_lossy().contains("/usb") {
-                continue;
-            }
-            let (id, desc) = identify(&sys, &m.majmin);
-            out.push(Device {
+            let mut p = Probe {
                 mount: PathBuf::from(&m.mount),
-                id,
-                desc: format!("{} {} {}", m.source, m.fstype, desc),
-            });
+                source: format!("{} ({}, {})", m.source, m.fstype, m.majmin),
+                usb: false,
+                id: String::new(),
+                desc: String::new(),
+                reason: String::new(),
+            };
+            match fs::canonicalize(format!("/sys/dev/block/{}", m.majmin)) {
+                Err(e) => p.reason = format!("no sysfs entry for {}: {e}", m.majmin),
+                Ok(sys) if !sys.to_string_lossy().contains("/usb") => {
+                    p.reason = format!("not on the USB bus ({})", sys.display())
+                }
+                Ok(sys) => {
+                    let (id, desc) = identify(&sys, &m.majmin);
+                    p.usb = true;
+                    p.id = id;
+                    p.desc = desc;
+                    p.reason = format!("USB bus ({})", sys.display());
+                }
+            }
+            out.push(p);
         }
         out
     }
@@ -65,7 +79,7 @@ impl Watcher {
                 return;
             }
             if r < 0 {
-                continue; // EINTR
+                return; // EINTR: signal (stop / log level reload)
             }
             if fds.len() > 1 && fds[1].revents & libc::POLLIN != 0 {
                 self.handle_uevent();
@@ -228,7 +242,7 @@ pub fn release(dev: &Device) {
     }
 }
 
-pub use crate::unix::install_signal_handlers;
+pub use crate::unix::{is_admin, notify_reload, pid_alive};
 use crate::unix::{copy_self, require_root};
 
 fn systemctl(args: &[&str]) -> Result<(), String> {
@@ -273,6 +287,52 @@ pub fn uninstall() -> Result<(), String> {
     let _ = fs::remove_file(BIN);
     println!("usbscan service removed (config, cache and log kept)");
     Ok(())
+}
+
+pub fn service_state() -> String {
+    if !Path::new(UNIT).exists() {
+        return "not installed (no usbscan.service unit)".into();
+    }
+    let out = Command::new("systemctl").args(["show", "usbscan.service", "-p", "ActiveState,SubState,MainPID,ActiveEnterTimestamp"]).output();
+    match out {
+        Ok(o) => {
+            let t = String::from_utf8_lossy(&o.stdout);
+            let get = |k: &str| t.lines().find_map(|l| l.strip_prefix(k)).unwrap_or("").to_string();
+            format!(
+                "{} ({}), pid {}, since {}",
+                get("ActiveState="),
+                get("SubState="),
+                get("MainPID="),
+                get("ActiveEnterTimestamp=")
+            )
+        }
+        Err(e) => format!("unknown (systemctl: {e})"),
+    }
+}
+
+pub fn doctor(cfg: &Config) -> Vec<(Check, String, String)> {
+    let mut v = Vec::new();
+    let systemd = Path::new("/run/systemd/system").exists();
+    v.push((
+        if systemd { Check::Ok } else { Check::Warn },
+        "systemd".into(),
+        if systemd { "present".into() } else { "not running: 'install' needs systemd (use 'usbscan run' under another supervisor)".into() },
+    ));
+    v.push(match fs::File::open("/proc/self/mountinfo") {
+        Ok(_) => (Check::Ok, "mountinfo".into(), "/proc/self/mountinfo readable".into()),
+        Err(e) => (Check::Fail, "mountinfo".into(), e.to_string()),
+    });
+    if cfg.auto_mount {
+        v.push(match open_uevent() {
+            Some(_) => (Check::Ok, "auto_mount".into(), "kernel uevent socket available".into()),
+            None => (Check::Fail, "auto_mount".into(), "cannot bind uevent socket (needs root)".into()),
+        });
+        let has_mount = Path::new("/bin/mount").exists() || Path::new("/usr/bin/mount").exists();
+        v.push((if has_mount { Check::Ok } else { Check::Fail }, "mount binary".into(), if has_mount { "found" } else { "missing" }.into()));
+    } else {
+        v.push((Check::Info, "auto_mount".into(), "disabled (only volumes mounted by the desktop/udisks are scanned)".into()));
+    }
+    v
 }
 
 #[cfg(test)]

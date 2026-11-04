@@ -4,7 +4,8 @@
 //! catches USB HDD/SSD enclosures that Windows reports as DRIVE_FIXED.
 
 use crate::config::Config;
-use crate::Device;
+use crate::diag::Check;
+use crate::{Device, Probe};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use windows_service::service::{
     ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept, ServiceErrorControl,
     ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState,
-    ServiceStatus, ServiceType,
+    ServiceStatus, ServiceType, UserEventCode,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
@@ -33,6 +34,8 @@ const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
 const IOCTL_STORAGE_QUERY_PROPERTY: u32 = 0x002D_1400;
 const BUS_TYPE_USB: i32 = 7;
+/// User-defined service control: re-read the log level override.
+const RELOAD_CODE: u32 = 128;
 
 #[repr(C)]
 struct StoragePropertyQuery {
@@ -136,10 +139,10 @@ fn volume_info(root: &[u16]) -> Option<(u32, String, String)> {
 
 pub struct Watcher {
     poll: Duration,
-    /// Fixed drives: letter -> is USB (fixed media never changes).
-    fixed: HashMap<char, bool>,
-    /// (letter, volume serial) -> (id, desc), or None if not USB.
-    vols: HashMap<(char, u32), Option<(String, String)>>,
+    /// Fixed drives: letter -> (is USB, hardware id) (fixed media never changes).
+    fixed: HashMap<char, (bool, String)>,
+    /// (letter, volume serial) -> classification.
+    vols: HashMap<(char, u32), Probe>,
 }
 
 impl Watcher {
@@ -149,48 +152,78 @@ impl Watcher {
         Watcher { poll: Duration::from_millis(cfg.poll_ms), fixed: HashMap::new(), vols: HashMap::new() }
     }
 
-    pub fn usb_mounts(&mut self) -> Vec<Device> {
+    pub fn probe(&mut self) -> Vec<Probe> {
         let mask = unsafe { GetLogicalDrives() };
         let present = |c: char| mask & (1 << (c as u8 - b'A')) != 0;
         self.fixed.retain(|c, _| present(*c));
         self.vols.retain(|(c, _), _| present(*c));
 
         let mut out = Vec::new();
-        for c in 'C'..='Z' {
+        for c in 'A'..='Z' {
             if !present(c) {
                 continue;
             }
             let root_s = format!(r"{c}:\");
             let root = wide(&root_s);
             let kind = unsafe { GetDriveTypeW(root.as_ptr()) };
-            if kind == DRIVE_FIXED {
-                let usb = *self.fixed.entry(c).or_insert_with(|| storage_info(c).map(|i| i.0).unwrap_or(false));
-                if !usb {
-                    continue;
-                }
-            } else if kind != DRIVE_REMOVABLE {
+            let skip = |source: &str, reason: String| Probe {
+                mount: PathBuf::from(&root_s),
+                source: source.to_string(),
+                usb: false,
+                id: String::new(),
+                desc: String::new(),
+                reason,
+            };
+            let kind_name = match kind {
+                DRIVE_REMOVABLE => "removable",
+                DRIVE_FIXED => "fixed",
+                4 => "network",
+                5 => "cdrom",
+                6 => "ramdisk",
+                _ => "unknown",
+            };
+            if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE {
+                out.push(skip(kind_name, format!("drive type {kind_name} is not scanned")));
                 continue;
             }
-            let Some((vserial, label, fs)) = volume_info(&root) else { continue }; // no media
-            let info = self
+            if kind == DRIVE_FIXED {
+                let (usb, hw) = self
+                    .fixed
+                    .entry(c)
+                    .or_insert_with(|| storage_info(c).unwrap_or((false, String::new())))
+                    .clone();
+                if !usb {
+                    out.push(skip("fixed", format!("fixed disk not on the USB bus ({hw})")));
+                    continue;
+                }
+            }
+            let Some((vserial, label, fs)) = volume_info(&root) else {
+                out.push(skip(kind_name, "no media / volume not ready".into()));
+                continue;
+            };
+            let p = self
                 .vols
                 .entry((c, vserial))
                 .or_insert_with(|| {
-                    let (usb, hw) = storage_info(c).unwrap_or((kind == DRIVE_REMOVABLE, String::new()));
-                    (usb || kind == DRIVE_REMOVABLE)
-                        .then(|| (format!("{hw}:{vserial:08X}"), format!("{label} {fs} {}", if usb { "USB" } else { "removable" })))
+                    let (usb, hw) = storage_info(c).unwrap_or((false, String::new()));
+                    Probe {
+                        mount: PathBuf::from(&root_s),
+                        source: format!("{kind_name} {fs} \"{label}\""),
+                        usb: true,
+                        id: format!("{hw}:{vserial:08X}"),
+                        desc: if usb { "USB".into() } else { "removable (non-USB bus, e.g. SD reader)".into() },
+                        reason: if usb { "bus type USB".into() } else { "removable media".into() },
+                    }
                 })
                 .clone();
-            if let Some((id, desc)) = info {
-                out.push(Device { mount: PathBuf::from(root_s), id, desc });
-            }
+            out.push(p);
         }
         out
     }
 
     pub fn wait(&mut self) {
         let end = Instant::now() + self.poll;
-        while Instant::now() < end && !crate::stopping() {
+        while Instant::now() < end && !crate::stopping() && !crate::RELOAD.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(250));
         }
     }
@@ -229,6 +262,10 @@ fn service_main(_args: Vec<OsString>) {
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        ServiceControl::UserEvent(code) if code.to_raw() == RELOAD_CODE => {
+            crate::RELOAD.store(true, std::sync::atomic::Ordering::Relaxed);
+            ServiceControlHandlerResult::NoError
+        }
         _ => ServiceControlHandlerResult::NotImplemented,
     };
     let Ok(h) = service_control_handler::register(NAME, handler) else { return };
@@ -244,6 +281,9 @@ fn service_main(_args: Vec<OsString>) {
         .unwrap_or_else(crate::config::default_path);
     let cfg = Config::load(&cfg_path);
     crate::log::init(&cfg, false);
+    for w in &cfg.warnings {
+        warn!("config: {w}");
+    }
     crate::run_monitor(cfg);
 
     let _ = h.set_service_status(status(ServiceState::Stopped));
@@ -336,4 +376,62 @@ pub fn uninstall() -> Result<(), String> {
     let _ = std::fs::remove_file(program_path());
     println!("usbscan service removed (config, cache and log kept)");
     Ok(())
+}
+
+// ------------------------------------------------------- observability
+
+pub fn is_admin() -> bool {
+    ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE).is_ok()
+}
+
+/// Process liveness is reported by the SCM (see service_state).
+pub fn pid_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+pub fn service_state() -> String {
+    let Ok(mgr) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT) else {
+        return "unknown (cannot connect to the service manager)".into();
+    };
+    let Ok(svc) = mgr.open_service(NAME, ServiceAccess::QUERY_STATUS) else {
+        return "not installed".into();
+    };
+    match svc.query_status() {
+        Ok(s) => format!(
+            "{}, pid {}",
+            match s.current_state {
+                ServiceState::Running => "running",
+                ServiceState::Stopped => "stopped",
+                ServiceState::StartPending => "start pending",
+                ServiceState::StopPending => "stop pending",
+                ServiceState::Paused => "paused",
+                _ => "transitioning",
+            },
+            s.process_id.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+        ),
+        Err(e) => format!("unknown ({e})"),
+    }
+}
+
+/// Sends user control 128 to the service: re-read the log level override.
+pub fn notify_reload() -> Result<(), String> {
+    let mgr = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT).map_err(werr)?;
+    let svc = mgr
+        .open_service(NAME, ServiceAccess::USER_DEFINED_CONTROL | ServiceAccess::QUERY_STATUS)
+        .map_err(werr)?;
+    let code = UserEventCode::from_raw(RELOAD_CODE).map_err(|e| e.to_string())?;
+    svc.notify(code).map_err(werr)?;
+    Ok(())
+}
+
+pub fn doctor(cfg: &Config) -> Vec<(Check, String, String)> {
+    let mut v = Vec::new();
+    let exe = program_path();
+    v.push((
+        if exe.exists() { Check::Ok } else { Check::Warn },
+        "binary".into(),
+        format!("{}{}", exe.display(), if exe.exists() { "" } else { " (not installed)" }),
+    ));
+    v.push((Check::Info, "poll interval".into(), format!("{} ms", cfg.poll_ms)));
+    v
 }
