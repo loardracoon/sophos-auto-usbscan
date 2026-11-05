@@ -1,6 +1,6 @@
 [package]
 name = "usbscan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Lightweight multi-OS service that triggers a Sophos antivirus scan whenever USB storage is connected"
 repository = "https://github.com/loardracoon/sophos-auto-usbscan"

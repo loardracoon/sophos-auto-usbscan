@@ -498,7 +498,7 @@ the service rewrites on every event:
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.2.0",
   "pid": 671,
   "started": "2026-11-04T21:40:35Z",
   "uptime_secs": 3600,
